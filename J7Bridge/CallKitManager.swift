@@ -104,7 +104,9 @@ final class CallKitManager: NSObject {
         provider.reportCall(with: uuid, endedAt: Date(), reason: reason)
         currentUUID = nil
         answerAction = nil
-        onAudioDeactivated?()
+        // AppModel.handleRemoteEnd() already closes the voice gate and stops the
+        // engine synchronously. Avoid issuing a second, untagged deactivation here;
+        // CallKit's didDeactivate callback may arrive after a subsequent call starts.
     }
 
     func clearCurrentCall() {
@@ -145,7 +147,8 @@ extension CallKitManager: CXProviderDelegate {
         action.fulfill()
         currentUUID = nil
         answerAction = nil
-        onAudioDeactivated?()
+        // onEnd (AppModel) closes audio before this action is fulfilled. Let the
+        // provider's didDeactivate notification represent the system transition.
     }
 
     func provider(_ provider: CXProvider, perform action: CXSetHeldCallAction) {
@@ -180,6 +183,13 @@ extension CallKitManager: CXProviderDelegate {
     }
 
     func provider(_ provider: CXProvider, didDeactivate audioSession: AVAudioSession) {
+        // CallKit callbacks do not carry the UUID whose audio session changed.
+        // If a new call is already current, a late deactivation from the previous
+        // call must not tear down the new call's audio engine.
+        if let currentUUID {
+            onLog?("[CALLKIT] DID_DEACTIVATE ignored; live call UUID=\(currentUUID.uuidString)")
+            return
+        }
         onLog?("[CALLSHARE_AUDIO_R1] didDeactivate CALLED")
         onLog?("[CALLKIT] audio session DEACT")
         onAudioDeactivated?()

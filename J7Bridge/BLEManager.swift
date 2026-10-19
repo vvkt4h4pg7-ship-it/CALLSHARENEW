@@ -40,7 +40,7 @@ final class BLEManager: NSObject, ObservableObject {
             delegate: self,
             queue: .main,
             options: [
-                CBCentralManagerOptionRestoreIdentifierKey: "com.ugur.callshare.ble-central.r1",
+                CBCentralManagerOptionRestoreIdentifierKey: "com.ugur.callshare.audiofixr2.ble-central.r1",
                 CBCentralManagerOptionShowPowerAlertKey: true
             ]
         )

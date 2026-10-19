@@ -32,6 +32,11 @@ final class WiFiVoiceEngine: NSObject {
     private let maximumQueuedPlaybackFrames = 4
     private var pendingPlaybackBuffers = 0
     private var playbackEpoch: UInt64 = 0
+    // If scheduled buffers stop completing, the queue can otherwise remain full
+    // forever while AVAudioEngine/playerNode still report isRunning/isPlaying.
+    private let playbackStallThreshold: TimeInterval = 0.30
+    private var lastPlaybackProgressUptime: TimeInterval = 0
+    private var playbackStallRecoveries = 0
 
     private var isRunning = false
     private var muted = false
@@ -187,6 +192,7 @@ final class WiFiVoiceEngine: NSObject {
         playerNode.reset()
         playbackEpoch &+= 1
         pendingPlaybackBuffers = 0
+        lastPlaybackProgressUptime = 0
         audioEngine.stop()
         micConverter = nil
         micInputFormat = nil
@@ -234,13 +240,20 @@ final class WiFiVoiceEngine: NSObject {
             routeRecoveryWorkItem?.cancel()
             routeRecoveryWorkItem = nil
             pendingRecoveryReasons.removeAll(keepingCapacity: true)
-            guard wasRunning || audioEngine.isRunning else { return }
+            guard wasRunning || audioEngine.isRunning || playerNode.isPlaying else {
+                // Invalidate delayed playback completions even for duplicate CallKit stop callbacks.
+                playbackEpoch &+= 1
+                pendingPlaybackBuffers = 0
+                lastPlaybackProgressUptime = 0
+                return
+            }
 
             audioEngine.inputNode.removeTap(onBus: 0)
             playerNode.stop()
             playerNode.reset()
             playbackEpoch &+= 1
             pendingPlaybackBuffers = 0
+            lastPlaybackProgressUptime = 0
             audioEngine.stop()
 
             micConverter = nil
@@ -253,6 +266,9 @@ final class WiFiVoiceEngine: NSObject {
     }
 
     func receivePCM(_ pcm: Data, sampleRate: UInt32, channels: UInt16, frames: UInt16) {
+        // Avoid queuing a closure for every idle J7 frame while the Core is still
+        // broadcasting. The queue-side guard below is retained for race safety.
+        guard runningSnapshot() else { return }
         guard sampleRate == 48_000,
               channels == 2,
               frames == UInt16(Self.packetFrames),
@@ -299,6 +315,9 @@ final class WiFiVoiceEngine: NSObject {
             stateLock.lock()
             isRunning = false
             stateLock.unlock()
+            playbackEpoch &+= 1
+            pendingPlaybackBuffers = 0
+            lastPlaybackProgressUptime = 0
             audioEngine.inputNode.removeTap(onBus: 0)
             playerNode.stop()
             playerNode.reset()
@@ -352,7 +371,12 @@ final class WiFiVoiceEngine: NSObject {
             stateLock.lock()
             isRunning = true
             stateLock.unlock()
+            // Each call start is a new playback epoch, so callbacks from previous
+            // calls cannot corrupt the new call's pending-frame counter.
+            playbackEpoch &+= 1
             pendingPlaybackBuffers = 0
+            playbackDroppedFrames = 0
+            lastPlaybackProgressUptime = ProcessInfo.processInfo.systemUptime
 
             playerNode.play()
             // Voice-open signaling is owned by BLE GATT in HYBRID R1.
@@ -552,11 +576,28 @@ final class WiFiVoiceEngine: NSObject {
         // At capacity, drop this incoming frame; the scheduled queue is already
         // limited to <=80 ms and drains naturally.
         if pendingPlaybackBuffers >= maximumQueuedPlaybackFrames {
-            playbackDroppedFrames += 1
-            if playbackDroppedFrames == 1 || playbackDroppedFrames % 25 == 0 {
-                report("[WIFI_AUDIO] PLAYBACK DROP incomingFrame=\(playbackDroppedFrames) pending=\(pendingPlaybackBuffers) max=\(maximumQueuedPlaybackFrames)")
+            let now = ProcessInfo.processInfo.systemUptime
+            let stalledFor = lastPlaybackProgressUptime > 0 ? now - lastPlaybackProgressUptime : 0
+            // A full queue for a few packets is transient; drop those newest packets.
+            // If no scheduled buffer completes for 300 ms, treat it as a playback
+            // stall and rebuild the graph once rather than resetting on every packet.
+            if stalledFor >= playbackStallThreshold &&
+                (lastEngineRecoveryUptime == 0 || now - lastEngineRecoveryUptime >= 1.0) {
+                playbackStallRecoveries += 1
+                lastEngineRecoveryUptime = now
+                report("[WIFI_AUDIO] PLAYBACK STALL pending=\(pendingPlaybackBuffers) ageMs=\(Int(stalledFor * 1000)) recovery=\(playbackStallRecoveries); rebuilding graph")
+                recoverAudioEngine(reason: "playback-queue-stall")
+                guard runningSnapshot(), audioEngine.isRunning, playerNode.isPlaying else {
+                    report("[WIFI_AUDIO] PLAYBACK STALL RECOVERY FAILED; dropping incoming frame")
+                    return
+                }
+            } else {
+                playbackDroppedFrames += 1
+                if playbackDroppedFrames == 1 || playbackDroppedFrames % 25 == 0 {
+                    report("[WIFI_AUDIO] PLAYBACK DROP incomingFrame=\(playbackDroppedFrames) pending=\(pendingPlaybackBuffers) max=\(maximumQueuedPlaybackFrames) noProgressMs=\(Int(stalledFor * 1000))")
+                }
+                return
             }
-            return
         }
 
         pendingPlaybackBuffers += 1
@@ -568,11 +609,12 @@ final class WiFiVoiceEngine: NSObject {
                 // decrement the queue count for newly scheduled audio.
                 guard scheduledEpoch == self.playbackEpoch else { return }
                 self.pendingPlaybackBuffers = max(0, self.pendingPlaybackBuffers - 1)
+                self.lastPlaybackProgressUptime = ProcessInfo.processInfo.systemUptime
             }
         }
         rxFrames += 1
         if rxFrames == 1 || rxFrames % 50 == 0 {
-            report("[WIFI_AUDIO] R3 RX PCM #\(rxFrames) 3840B pending=\(pendingPlaybackBuffers)")
+            report("[WIFI_AUDIO] R3 RX PCM #\(rxFrames) 3840B pending=\(pendingPlaybackBuffers) epoch=\(playbackEpoch)")
         }
         if !playerNode.isPlaying { playerNode.play() }
     }

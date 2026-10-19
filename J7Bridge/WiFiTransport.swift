@@ -68,6 +68,9 @@ final class WiFiTransport {
     // R2: use a real UDP datagram socket for RX. This avoids NWConnection peer churn
     // when the Android sender uses an ephemeral UDP source port.
     private var rxSocket: Int32 = -1
+    // RX recovery was present in the installed R2 build but had been removed
+    // from the later working tree. Keep the receiver recoverable after terminal recvfrom errors.
+    private var rxReconnectWorkItem: DispatchWorkItem?
     private var rxDatagrams: UInt64 = 0
     private var rxAudioDatagrams: UInt64 = 0
     private var sequence: UInt32 = 0
@@ -82,6 +85,14 @@ final class WiFiTransport {
     private var uplinkRetryAttempt = 0
     private var controlRetryAttempt = 0
     private var started = false
+
+    // Call-aware receive gate. The UDP socket stays bound for discovery/diagnostics,
+    // but idle audio datagrams are not reassembled or delivered to the audio engine.
+    private let audioGateLock = NSLock()
+    private var audioReceiveEnabled = false
+    private var audioGateGeneration: UInt64 = 0
+    // RX-thread-only: last gate generation whose fragment/sequence state was reset.
+    private var rxObservedAudioGateGeneration: UInt64 = 0
 
     init(j7Host: String = "192.168.104.12", port: UInt16 = 50005) {
         self._j7Host = j7Host
@@ -102,6 +113,30 @@ final class WiFiTransport {
         }
     }
 
+    /// Enable PCM parsing/delivery only while CallKit + GSM audio are active.
+    /// This does not stop J7's standalone Core from transmitting; it avoids idle
+    /// reassembly and prevents idle PCM from entering the iPhone playback path.
+    func setAudioReceiveEnabled(_ enabled: Bool) {
+        audioGateLock.lock()
+        let changed = audioReceiveEnabled != enabled
+        if changed {
+            audioReceiveEnabled = enabled
+            audioGateGeneration &+= 1
+        }
+        let generation = audioGateGeneration
+        audioGateLock.unlock()
+        if changed {
+            onStatus?("[WIFI_AUDIO] RX DELIVERY GATE \(enabled ? "OPEN" : "CLOSED") generation=\(generation)")
+        }
+    }
+
+    private func audioGateSnapshot() -> (enabled: Bool, generation: UInt64) {
+        audioGateLock.lock()
+        let snapshot = (audioReceiveEnabled, audioGateGeneration)
+        audioGateLock.unlock()
+        return snapshot
+    }
+
     func stop() {
         txQueue.async { [weak self] in
             guard let self else { return }
@@ -110,6 +145,8 @@ final class WiFiTransport {
             self.uplinkReconnectWorkItem = nil
             self.controlReconnectWorkItem?.cancel()
             self.controlReconnectWorkItem = nil
+            self.rxReconnectWorkItem?.cancel()
+            self.rxReconnectWorkItem = nil
             self.uplinkRetryAttempt = 0
             self.controlRetryAttempt = 0
             self.onStatus?("[WIFI] TRANSPORT STOP requested")
@@ -224,6 +261,10 @@ final class WiFiTransport {
     }
 
     private func startListener() {
+        guard rxSocket < 0 else {
+            onStatus?("[WIFI] UDP RX start skipped; socket already open fd=\(rxSocket)")
+            return
+        }
         // R2 intentionally uses a BSD UDP socket for RX instead of NWListener/NWConnection.
         // NWConnection can create/tear down peer objects as the Android sender changes
         // its ephemeral source port. A bound datagram socket receives every UDP packet
@@ -277,9 +318,26 @@ final class WiFiTransport {
             }
 
             if count < 0 {
-                if errno == EINTR { continue }
+                let socketError = errno
+                if socketError == EINTR { continue }
                 if rxSocket == fd {
-                    onStatus?("[WIFI] UDP RX ERROR errno=\(errno)")
+                    onStatus?("[WIFI] UDP RX ERROR errno=\(socketError); scheduling socket recovery")
+                    // Never leave rxSocket pointing at a dead descriptor: start()
+                    // is one-shot, so the receiver must explicitly re-bind itself.
+                    txQueue.async { [weak self] in
+                        guard let self, self.started, self.rxSocket == fd else { return }
+                        self.rxSocket = -1
+                        _ = shutdown(fd, SHUT_RDWR)
+                        _ = close(fd)
+                        self.rxReconnectWorkItem?.cancel()
+                        let work = DispatchWorkItem { [weak self] in
+                            guard let self, self.started, self.rxSocket < 0 else { return }
+                            self.onStatus?("[WIFI] UDP RX RECOVERY retry bind port=\(self.port)")
+                            self.startListener()
+                        }
+                        self.rxReconnectWorkItem = work
+                        self.txQueue.asyncAfter(deadline: .now() + 1.0, execute: work)
+                    }
                 }
                 return
             }
@@ -295,9 +353,15 @@ final class WiFiTransport {
             }
             if isAudio {
                 rxAudioDatagrams += 1
-                if rxAudioDatagrams == 1 || rxAudioDatagrams % 50 == 0 {
-                    onStatus?("[WIFI_AUDIO] RX DATAGRAM #\(rxAudioDatagrams) len=\(count) total=\(rxDatagrams)")
+                let gateOpen = audioGateSnapshot().enabled
+                // Lower idle log volume while making clear that packets are still arriving.
+                let logInterval: UInt64 = gateOpen ? 50 : 500
+                if rxAudioDatagrams == 1 || rxAudioDatagrams % logInterval == 0 {
+                    onStatus?("[WIFI_AUDIO] RX DATAGRAM #\(rxAudioDatagrams) len=\(count) total=\(rxDatagrams) voiceGate=\(gateOpen ? "OPEN" : "CLOSED")")
                 }
+                // The J7 Core currently transmits continuously. Keep the RX socket
+                // alive, but skip fragment assembly and PCM delivery while idle.
+                if !gateOpen { continue }
             } else if rxDatagrams <= 5 {
                 onStatus?("[WIFI] RX DATAGRAM #\(rxDatagrams) len=\(count)")
             }
@@ -573,6 +637,19 @@ final class WiFiTransport {
     }
 
     private func parseAudioDatagram(_ data: Data) {
+        let gate = audioGateSnapshot()
+        if gate.generation != rxObservedAudioGateGeneration {
+            // This function runs only on the serial RX loop; reset RX-owned state here
+            // instead of mutating it across queues when a call opens/closes.
+            rxFragmentParts.removeAll(keepingCapacity: true)
+            rxFragmentOrder.removeAll(keepingCapacity: true)
+            lastDeliveredAudioSequence = nil
+            lastDeliveredAudioPCM = nil
+            lastDeliveredWasConcealment = false
+            rxObservedAudioGateGeneration = gate.generation
+            onStatus?("[WIFI_AUDIO] RX stream state reset gateGeneration=\(gate.generation) enabled=\(gate.enabled)")
+        }
+        guard gate.enabled else { return }
         let bytes = [UInt8](data)
         guard bytes.count >= Self.audioHeaderSize else {
             onStatus?("[WIFI] AUDIO DROP short=\(data.count)")

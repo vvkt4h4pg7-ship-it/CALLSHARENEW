@@ -155,6 +155,7 @@ final class AppModel: ObservableObject {
             self.voiceOpenCommandSent = false
             self.remoteVoiceOpen = false
             self.gsmCallReady = false
+            self.wifi.setAudioReceiveEnabled(false)
             self.wifiVoice.stop()
             self.log("[CALLKIT] AUDIO DEACTIVATED; BLE voice gate closed")
         }
@@ -235,6 +236,7 @@ final class AppModel: ObservableObject {
             voiceOpenCommandSent = false
             gsmCallReady = false
             log("[BLE] VOICE CLOSE EVENT")
+            wifi.setAudioReceiveEnabled(false)
             wifiVoice.stop()
         case K7Protocol.evtMakeCall:
             callStatus = "DIALING"
@@ -340,13 +342,20 @@ final class AppModel: ObservableObject {
             log("[VOICE] WAIT CallKit audio activation")
             return
         }
-        log("[HYBRID] Voice gate passed: CallKit active + GSM active + BLE VOICE_OPEN; starting Wi-Fi R2 audio")
-        if !wifiVoice.start() { log("[VOICE] Wi-Fi voice engine start failed; inspect audio logs") }
+        log("[HYBRID] Voice gate passed: CallKit active + GSM active + BLE VOICE_OPEN; starting Wi-Fi R3 audio")
+        if wifiVoice.start() {
+            wifi.setAudioReceiveEnabled(true)
+        } else {
+            wifi.setAudioReceiveEnabled(false)
+            log("[VOICE] Wi-Fi voice engine start failed; inspect audio logs")
+        }
     }
 
     private func endFromCallKit() {
         ble.sendVoiceClose()
         ble.sendHangup()
+        callAudioActive = false
+        wifi.setAudioReceiveEnabled(false)
         wifiVoice.stop()
         voiceOpenCommandSent = false
         remoteVoiceOpen = false
@@ -360,6 +369,8 @@ final class AppModel: ObservableObject {
         let wasRinging = callStatus == "RINGING"
         let direction = currentDirection ?? .incoming
         ble.sendVoiceClose()
+        callAudioActive = false
+        wifi.setAudioReceiveEnabled(false)
         wifiVoice.stop()
         voiceOpenCommandSent = false
         remoteVoiceOpen = false

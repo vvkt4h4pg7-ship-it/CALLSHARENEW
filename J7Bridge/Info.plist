@@ -7,7 +7,7 @@
     <key>CFBundleDisplayName</key>
     <string>CALLSHARE</string>
     <key>CFBundleIdentifier</key>
-    <string>com.ugur.callshare</string>
+    <string>$(PRODUCT_BUNDLE_IDENTIFIER)</string>
     <key>CFBundleName</key>
     <string>CALLSHARE</string>
     <key>CFBundlePackageType</key>
